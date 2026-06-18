@@ -7,3 +7,5 @@ from .multiscale_gaussian import MultiscaleGaussian
 from .swiss_roll import SwissRoll
 from .torus import Torus
 from .von_mises import VonMisesEuclidean
+from .funnel import Funnel
+from .moon import Moon

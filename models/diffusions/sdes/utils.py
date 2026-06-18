@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 # A threshold for the dimension of the data, if the dimension is above this threshold, the hutchinson method is used
 HUTCHINSON_DATA_DIM_THRESHOLD = 3500
-
+ALLOW_FLASH_ATTN_IN_JVP = False
 
 class VpSdeGaussianAnalytical(torch.nn.Module):
     """
@@ -138,21 +138,41 @@ def _jvp_mode(flag: bool, device: torch.device):
     this issue will be resolved in a future version of torch
     as jvp mode reduces the speed of JVP computation.
     """
+    # 251208 geosada changed
+    # if device.type == "cuda":
+    #     torch.backends.cuda.enable_flash_sdp(not flag)
+    #     torch.backends.cuda.enable_mem_efficient_sdp(not flag)
+    #     torch.backends.cuda.enable_math_sdp(flag)
     if device.type == "cuda":
-        torch.backends.cuda.enable_flash_sdp(not flag)
-        torch.backends.cuda.enable_mem_efficient_sdp(not flag)
-        torch.backends.cuda.enable_math_sdp(flag)
+        if ALLOW_FLASH_ATTN_IN_JVP:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+        else:
+            torch.backends.cuda.enable_flash_sdp(not flag)
+            torch.backends.cuda.enable_mem_efficient_sdp(not flag)
+            torch.backends.cuda.enable_math_sdp(flag)
 
+# 251208 geosada changed
+# @contextmanager
+# def _jvp_mode_enabled(device: torch.device):
+#     _jvp_mode(True, device)
+#     try:
+#         yield
+#     finally:
+#         _jvp_mode(False, device)
 
 @contextmanager
 def _jvp_mode_enabled(device: torch.device):
-    _jvp_mode(True, device)
+    _jvp_mode(True, device) 
     try:
         yield
     finally:
-        _jvp_mode(False, device)
-
-
+        if ALLOW_FLASH_ATTN_IN_JVP:
+             _jvp_mode(True, device) 
+        else:
+             _jvp_mode(False, device) 
+                
 def compute_trace_of_jacobian(
     fn: Callable[[torch.Tensor], torch.Tensor],
     x: torch.Tensor,
@@ -210,6 +230,8 @@ def compute_trace_of_jacobian(
         # The general implementation is to compute the quadratic forms of [v^T \\nabla_x v^T score(x, t)] in a list and then take the average
         all_quadratic_forms = []
         sample_count = hutchinson_sample_count if method != "deterministic" else ambient_dim
+        if verbose:
+            print('INFO compute_trace_of_jacobian:', method, sample_count)
         # all_v is a tensor of size [batch_size * sample_count, *data_shape] where each row is an appropriate vector for the quadratic forms
         if method == "hutchinson_gaussian":
             all_v = torch.randn(size=(batch_size * sample_count, *data_shape)).cpu().float()

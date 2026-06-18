@@ -128,8 +128,19 @@ class MLPUnet(nn.Module):
             if self.layer_info[i + 1][1] == -1:
                 interim = layer(embeddings[-1])
             else:
+                # 251106 for multi-GPU
+                #interim = layer(
+                #    torch.cat([embeddings[self.layer_info[i + 1][1]], embeddings[-1]], dim=-1)
+                #)
+                device = x.device  # <-- add this line just above
                 interim = layer(
-                    torch.cat([embeddings[self.layer_info[i + 1][1]], embeddings[-1]], dim=-1)
+                    torch.cat(
+                        [
+                            embeddings[self.layer_info[i + 1][1]].to(device),
+                            embeddings[-1].to(device),
+                        ],
+                        dim=-1,
+                    )
                 )
             if i < len(self.layers) - 1:
                 interim = self.activation(interim)

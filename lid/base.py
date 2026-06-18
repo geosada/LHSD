@@ -144,7 +144,7 @@ class LIDEstimator(ABC):
         artifact_class = getattr(class_of_self, "Artifact")
         assert isinstance(
             artifact, artifact_class
-        ), f"The artifact should be of type {artifact_class}"
+        ), f"The artifact should be of type {artifact_class}, but {artifact}"
 
         kwargs_filterd = filter_kwargs_for_function(
             self.compute_lid_from_artifact, lid_artifact=artifact, **kwargs

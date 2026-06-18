@@ -1,0 +1,131 @@
+import math
+import torch
+
+from .lid_base import LIDDistribution
+
+
+class Moon(LIDDistribution):
+    r"""
+    3D "moon" (crescent) manifold in R^3:
+      - (x1, x2) sampled uniformly from a crescent:
+            Outer:  center (0, 0),     radius r
+            Inner:  center (0, -inner_shift), radius inner_ratio * r  (removed)
+      - x3 is a uniform interval whose half-thickness τ depends smoothly on angle φ,
+        making the top thin and the bottom thick.
+
+    Defaults reproduce the paper's numbers:
+        r = 3.0, inner_ratio = 0.899, inner_shift = 0.1
+
+    Intrinsic dimensionality (LID) = 3 everywhere.
+
+    Args:
+        r (float): outer radius of crescent. Default: 3.0
+        inner_ratio (float): inner radius as fraction of r. Default: 0.899
+        inner_shift (float): vertical shift of inner circle center. Default: 0.1
+        noise (float): ambient isotropic Gaussian noise std. Default: 0.0
+        center (tuple[float, float, float]): added offset. Default: (0., 0., 0.)
+        scale (float): multiplicative scaling. Default: 1.0
+        batch_factor (int): factor for vectorized rejection sampling. Default: 4
+    """
+
+    def __init__(
+        self,
+        r: float = 3.0,
+        inner_ratio: float = 0.899,
+        inner_shift: float = 0.1,
+        noise: float = 0.0,
+        center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        scale: float = 1.0,
+        batch_factor: int = 4,
+    ):
+        assert r > 0.0
+        assert 0.0 < inner_ratio < 1.0
+        self.r = float(r)
+        self.inner_ratio = float(inner_ratio)
+        self.inner_shift = float(inner_shift)
+        self.noise = float(noise)
+        self.center = (float(center[0]), float(center[1]), float(center[2]))
+        self.scale = float(scale)
+        self.batch_factor = int(batch_factor)
+
+    def _sample_crescent_2d(self, n_samples: int, g: torch.Generator) -> torch.Tensor:
+        """Uniform samples from the crescent in R^2 via vectorized rejection sampling."""
+        r = self.r
+        inner_r = self.inner_ratio * r
+        inner_cy = -self.inner_shift  # inner center at (0, -inner_shift)
+
+        xs = []
+        need = n_samples
+        # propose in outer disk: φ~U[0,2π), ρ~radius with pdf ∝ ρ => ρ = r*sqrt(u)
+        while need > 0:
+            m = max(need * self.batch_factor, 1024)
+            phi = torch.rand(m, generator=g) * (2.0 * math.pi)
+            rho = r * torch.sqrt(torch.rand(m, generator=g))
+
+            x = rho * torch.cos(phi)
+            y = rho * torch.sin(phi)
+
+            # reject those inside inner disk
+            inside_inner = (x ** 2 + (y - inner_cy) ** 2) < (inner_r ** 2)
+            keep = ~inside_inner
+            if keep.any():
+                kept_xy = torch.stack([x[keep], y[keep]], dim=1)
+                xs.append(kept_xy)
+                need -= kept_xy.shape[0]
+
+        xy = torch.cat(xs, dim=0)[:n_samples]
+        return xy
+
+    def sample(
+        self,
+        sample_shape,
+        return_dict: bool = False,
+        seed: int | None = None,
+    ):
+        # Normalize sample_shape to (N, 3)
+        if isinstance(sample_shape, int):
+            sample_shape = (sample_shape, 3)
+        assert len(sample_shape) == 1 or (
+            len(sample_shape) == 2 and sample_shape[1] == 3
+        ), "Sample shape should be N x 3"
+        n_samples = sample_shape[0]
+
+        g = torch.Generator()
+        if seed is not None:
+            g.manual_seed(int(seed))
+
+        # (x1, x2): crescent samples
+        xy = self._sample_crescent_2d(n_samples, g)
+        x1, x2 = xy[:, 0], xy[:, 1]
+
+        # angle φ for thickness modulation (atan2 in [-π, π])
+        phi = torch.atan2(x2, x1)
+
+        # τ(φ) = r * (0.001 + 0.2 * ((1 - sin φ)/2))
+        #  - top (φ≈π/2):  τ ≈ 0.001 r (thin)
+        #  - bottom (φ≈-π/2): τ ≈ 0.201 r (thick)
+        tau = self.r * (0.001 + 0.2 * (0.5 * (1.0 - torch.sin(phi))))
+
+        # x3 ~ Uniform[-τ, τ]
+        u = torch.rand(n_samples, generator=g) * 2.0 - 1.0
+        x3 = tau * u
+
+        x = torch.stack([x1, x2, x3], dim=1)
+
+        if self.scale != 1.0:
+            x = self.scale * x
+        if self.center != (0.0, 0.0, 0.0):
+            c = torch.tensor(self.center, dtype=x.dtype)
+            x = x + c
+
+        if self.noise > 0.0:
+            x = x + self.noise * torch.randn_like(x, generator=g)
+
+        if return_dict:
+            return {
+                "samples": x.float(),
+                "lid": 3 * torch.ones(n_samples, dtype=torch.long),
+                "idx": torch.zeros(n_samples, dtype=torch.long),
+            }
+        return x.float()
+

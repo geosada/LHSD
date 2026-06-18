@@ -1,3 +1,7 @@
+# models/diffusions/sdes/sdes.py
+# (Modified to add safe debug instrumentation in Sde.score)
+# Comments are in English as requested.
+
 import functools
 import math
 import numbers
@@ -36,11 +40,32 @@ class Sde(ABC, nn.Module):
     Args:
         score_net: a network corresponding to (x, t) |-> s(x, t) * sigma(t), with sigma(t)
             as defined in self.sigma(t) below
+
+        NOTE:
+        By default, this Sde.score() assumes `score_net(x,t)` returns `sigma(t) * score(x,t)`.
+        If your `score_net` returns the raw score directly, set:
+            self._debug_expected = "raw_score"
+        (You can do this from your notebook without modifying this file further.)
     """
 
     def __init__(self, score_net: torch.nn.Module):
         super().__init__()
         self.score_net = score_net
+
+        # =========================
+        # DEBUG / SAFETY INSTRUMENTS
+        # =========================
+        # Enable/disable debug printing inside `score()`.
+        self._debug_score = False
+
+        # Print every N calls (useful when score() is called in loops).
+        self._debug_score_every = 1
+        self._debug_score_count = 0
+
+        # Convention toggle:
+        #   "sigma_score": score_net returns sigma(t) * score(x,t), and we divide by sigma(t).
+        #   "raw_score"  : score_net returns score(x,t) directly, and we do NOT divide.
+        self._debug_expected = "sigma_score"
 
     @abstractmethod
     def drift(self, x, t):
@@ -56,8 +81,14 @@ class Sde(ABC, nn.Module):
 
     def score(self, x, t, **score_kwargs):
         """
-        The score s(x, t) of the forward SDE at time t,
-        the output of the model is used directly, otherwise, the output is normalized by the standard deviation of the score.
+        The score s(x, t) of the forward SDE at time t.
+
+        Default convention:
+          - score_net(x,t) returns sigma(t) * s(x,t)
+          - this function returns s(x,t) by dividing by sigma(t)
+
+        If your score_net already returns the raw score, set:
+            self._debug_expected = "raw_score"
         """
 
         sigma_t = self.sigma(t).to(x.device)
@@ -70,9 +101,68 @@ class Sde(ABC, nn.Module):
             new_dims = x.ndim - sigma_t.ndim  # Expand sigma_t for broadcasting
             sigma_t = sigma_t.reshape(x.shape[:1] + (1,) * new_dims)
 
-        # Compute score
-        score_sigma_t = self.score_net(x, t, **score_kwargs)
-        return score_sigma_t / sigma_t
+        # -------------------------
+        # Debug printing (optional)
+        # -------------------------
+        self._debug_score_count += 1
+        do_dbg = self._debug_score and (self._debug_score_count % self._debug_score_every == 0)
+
+        if do_dbg:
+            # x statistics
+            x0 = x.detach()
+            print(
+                f"[Sde.score DEBUG] x: shape={tuple(x0.shape)} "
+                f"min={float(x0.min().cpu()):.4g} max={float(x0.max().cpu()):.4g} "
+                f"mean={float(x0.mean().cpu()):.4g} std={float(x0.std().cpu()):.4g}"
+            )
+
+            # t statistics (after batching)
+            t0 = t.detach()
+            print(
+                f"[Sde.score DEBUG] t: shape={tuple(t0.shape)} "
+                f"min={float(t0.min().cpu()):.4g} max={float(t0.max().cpu()):.4g} "
+                f"mean={float(t0.float().mean().cpu()):.4g}"
+            )
+
+            # sigma_t statistics (broadcasted)
+            st = sigma_t.detach()
+            # Reduce to per-sample scalars even if sigma_t is broadcasted to (B,1,1,1,...)
+            st_flat = st.view(st.shape[0], -1)[:, 0]
+            print(
+                f"[Sde.score DEBUG] sigma_t: shape={tuple(st.shape)} "
+                f"min={float(st_flat.min().cpu()):.6g} max={float(st_flat.max().cpu()):.6g} "
+                f"mean={float(st_flat.mean().cpu()):.6g} sigma2_mean={float((st_flat**2).mean().cpu()):.6g}"
+            )
+            print(f"[Sde.score DEBUG] convention expected: {self._debug_expected}")
+
+        # Compute raw network output
+        score_out = self.score_net(x, t, **score_kwargs)
+
+        if do_dbg:
+            y0 = score_out.detach()
+            print(
+                f"[Sde.score DEBUG] score_net(x,t) output: shape={tuple(y0.shape)} "
+                f"min={float(y0.min().cpu()):.4g} max={float(y0.max().cpu()):.4g} "
+                f"mean={float(y0.mean().cpu()):.4g} std={float(y0.std().cpu()):.4g}"
+            )
+
+        # Normalize according to chosen convention
+        if self._debug_expected == "raw_score":
+            # score_net already returns the score ∇ log p_t(x)
+            score = score_out
+        else:
+            # default: score_net returns sigma(t) * score
+            score = score_out / sigma_t
+
+        if do_dbg:
+            s0 = score.detach()
+            print(
+                f"[Sde.score DEBUG] returned score: shape={tuple(s0.shape)} "
+                f"min={float(s0.min().cpu()):.4g} max={float(s0.max().cpu()):.4g} "
+                f"mean={float(s0.mean().cpu()):.4g} std={float(s0.std().cpu()):.4g}"
+            )
+
+        return score
 
     @abstractmethod
     def solve_forward_sde(self, x_start, t_end=1.0, t_start=0.0, return_eps=False):
@@ -140,7 +230,8 @@ class Sde(ABC, nn.Module):
         ts = batch_linspace(t_start, t_end, steps=steps).to(device)
         delta_t = copy_tensor_or_create((t_end - t_start) / (steps - 1))  # Negative in reverse time
 
-        for t in ts:
+        rng = tqdm(ts, desc="Iterating the solver")
+        for t in rng:
             score = self.score(x, t, **score_kwargs)
             drift = self.drift(x, t)
             diff = self.diff(t)
@@ -165,11 +256,9 @@ class Sde(ABC, nn.Module):
         self,
         x: torch.Tensor,
         t: float,
-        # Set by default to the less efficient but accurate method:
         method: (
             Literal["hutchinson_gaussian", "hutchinson_rademacher", "deterministic"] | None
         ) = None,
-        # The number of samples if one opts for estimation methods to save time:
         hutchinson_sample_count: int = HUTCHINSON_DATA_DIM_THRESHOLD,
         chunk_size: int = 128,
         seed: int = 42,
@@ -177,6 +266,7 @@ class Sde(ABC, nn.Module):
     ):
         """
         Return the trace of the drift derivative for the log_prob calculation.
+
         In the generic case, we can use the Hutchinson estimator for this purpose.
         However, in many cases such as VpSDE and VeSDE, the trace of the drift derivative
         can be directly computed using the diffusion hyperparameters.
@@ -201,11 +291,9 @@ class Sde(ABC, nn.Module):
         self,
         x: torch.Tensor,
         t: float,
-        # Set by default to the less efficient but accurate method:
         method: (
             Literal["hutchinson_gaussian", "hutchinson_rademacher", "deterministic"] | None
         ) = None,
-        # The number of samples if one opts for estimation methods to save time:
         hutchinson_sample_count: int = HUTCHINSON_DATA_DIM_THRESHOLD,
         chunk_size: int = 128,
         seed: int = 42,
@@ -213,15 +301,11 @@ class Sde(ABC, nn.Module):
         **score_kwargs,
     ):
         """
-        This function computes the Laplacian for a given batch of datapoints. Laplacian is the trace of the hessian
-        of the density (log_prob) function. The Hessian of the log_prob is in fact the Jacbian of the score function
-        therefore, we can compute the trace of the Jacobian of the score function instead. Thus, we only pass
-        the score function to the JVP-based trace estimator `compute_trace_of_jacobian`.
+        Computes Laplacian (trace of Jacobian of the score) via JVP-based trace estimator.
 
-        For more information, refer to the documention of `.utils.compute_trace_of_jacobian`.
+        Note:
+        Here the "Hessian of log_prob" equals the Jacobian of the score function.
         """
-
-        # score_fn takes in 'x' and returns the Jacobian of the density for 'x'
         score_fn = functools.partial(self.score, t=t, **score_kwargs)
         return compute_trace_of_jacobian(
             fn=score_fn,
@@ -247,25 +331,8 @@ class Sde(ABC, nn.Module):
         **score_kwargs,
     ):
         """
-        For the marginal density at time 't', this function computes the log probability of the batch of data
-        in the input 'x'.  This is done by first rewriting the SDE in the ODE format and then using the instantaneous
-        change-of-variables formulaton of the log_probabilities.
-
-        Args:
-            x: a batch of input tensors
-            t: the timestep of the ODE.
-            t_end: the final time of the ODE.
-            steps: The number of steps for the ODE solver
-            verbose: If True, shows a progress-bar of the ODE as it is being solved
-            drift_trace_kwargs: Keyword arguments to be passed into
-                `self._trace_of_drift_derivative` for trace estimation
-            laplacian_kwargs: Keyword arguments to be passed into `self.laplacian` for trace
-                estimation
-            shared_trace_kwargs: Keyword arguments to be passed to be trace estimation methods;
-                will be overriden by any of the two above dictionaries
-            **score_kwargs: Keyword arguments to be passed into the score function
-        Returns:
-            A tensor of size (batch_size, ) with the i'th element being the corresponding Gaussian convolution.
+        Computes log probability by solving the reverse-time ODE and integrating
+        instantaneous change-of-variables.
         """
         assert t <= t_end, f"t should be less than t_end, got t={t} and t_end={t_end}"
 
@@ -282,7 +349,6 @@ class Sde(ABC, nn.Module):
         if shared_trace_kwargs is None:
             shared_trace_kwargs = {}
 
-        # Create a tensor of zeros with the same device and dtype as 'x' with shape (batch_size,)
         log_p = torch.zeros(batch_size, device=device, dtype=x.dtype)
 
         ts = batch_linspace(t, t_end, steps=steps).to(device)
@@ -290,49 +356,33 @@ class Sde(ABC, nn.Module):
         rng = tqdm(ts, desc="Iterating the ODE") if verbose else ts
 
         for s in rng:
-            # The ODE is:
-            # dx = f(x, t) dt - 0.5 * g^2(t) \\nabla_x log p_t(x) dt
-            # the instantaneous change of variables formula takes the derivative of the RHS and
-            # computes its trace to update the log probability
             trace_of_drift_derivative = self._trace_of_drift_derivative(
                 x=x, t=s, **(shared_trace_kwargs | drift_trace_kwargs)
             )
             trace_of_score_derivative = self.laplacian(
                 x=x, t=s, **(shared_trace_kwargs | laplacian_kwargs | score_kwargs)
             )
-            # trace is a linear function so we can separate out the different trace terms
             log_p += delta_s * (
                 trace_of_drift_derivative - 0.5 * self.diff(s) ** 2 * trace_of_score_derivative
             )
-            # Update the value of x using the ODE appropriately (Euler)
             x += delta_s * (
                 self.drift(x, s) - 0.5 * self.diff(s) ** 2 * self.score(x, s, **score_kwargs)
             )
 
-        # finally add the prior
         log_p += self.prior_log_prob(x, t_end)
-
         return log_p
 
     def prior_log_prob(self, x: torch.Tensor, t_end: float = 1.0):
-        """In diffusion models, the prior is assumed to be a Gaussian with mean 0 and standard deviation sigma(t_end)"""
+        """Prior is Gaussian with mean 0 and std sigma(t_end)."""
         sigma = self.sigma(t_end)
         ambient_dim = x.numel() // x.shape[0]
-        # return the log probability of a Gaussian with mean 0 and standard deviation sigma
         log_normalizing_factor = 0.5 * ambient_dim * math.log(2 * math.pi * sigma**2)
         exponential_term = -0.5 * torch.sum(x * x, dim=tuple(range(1, x.dim()))) / sigma**2
         return exponential_term - log_normalizing_factor
 
 
 class VpSde(Sde):
-    """The variance-preserving SDE described by Song et al. (2020) in equation (11).
-
-    Here, the SDE is given by
-    dx = -(1/2) beta(t) x dt + sqrt(beta(t)) dw;
-    ie., f(x, t) = -(1/2)beta(t)x and g(t) = sqrt(beta(t)).
-
-    For beta(t), we use a linear schedule: beta(t) = (beta_max - beta_min)*(t/T) + beta_min.
-    """
+    """The variance-preserving SDE described by Song et al. (2020) in equation (11)."""
 
     def __init__(
         self,
@@ -349,10 +399,9 @@ class VpSde(Sde):
     def drift(self, x, t):
         """The drift coefficient f(x, t) of the forward SDE"""
         t = copy_tensor_or_create(t, device=x.device)
-        if t.ndim > 0:  # Add dimensions for broadcasting
+        if t.ndim > 0:
             new_dims = x.ndim - t.ndim
             t = t.reshape(x.shape[:1] + (1,) * new_dims)
-
         return -self.beta(t) * x / 2
 
     def diff(self, t):
@@ -360,10 +409,7 @@ class VpSde(Sde):
         return torch.sqrt(self.beta(t))
 
     def mu_scale(self, t_end, t_start=0.0):
-        """Scaling factor for the mean of x(t_end) | x(t_start).
-
-        The mean should equal mu_scale(t_end, t_start) * x(t_start)
-        """
+        """Scaling factor for the mean of x(t_end) | x(t_start)."""
         return torch.exp(-self.beta_integral(t_start, t_end) / 2)
 
     def sigma(self, t_end, t_start=0):
@@ -381,7 +427,7 @@ class VpSde(Sde):
         return self.beta_diff / (2 * self.t_max) * (t_end**2 - t_start**2) + self.beta_min * t_diff
 
     def _trace_of_drift_derivative(self, x: torch.Tensor, t: float):
-        """Override the trace of the drift derivative into an anlytical form which is fast to compute"""
+        """Analytical trace of drift derivative for VP-SDE."""
         ambient_dim = x.numel() // x.shape[0]
         batch_size = x.shape[0]
         return (
@@ -401,27 +447,21 @@ class VpSde(Sde):
         sigma_end = self.sigma(t_start=t_start, t_end=t_end)
         eps = torch.randn_like(x_start)
 
-        if mu_scale.ndim > 0:  # Add a broadcasting dimensions to the scalars
+        if mu_scale.ndim > 0:
             new_dims = x_start.ndim - mu_scale.ndim
             mu_scale = mu_scale.reshape(x_start.shape[:1] + (1,) * new_dims)
             sigma_end = sigma_end.reshape(x_start.shape[:1] + (1,) * new_dims)
 
         x_end = mu_scale * x_start + sigma_end * eps
 
-        if return_eps:  # epsilon, the random noise value, may be needed for training
+        if return_eps:
             return x_end, eps
         else:
             return x_end
 
 
 class VeSde(Sde):
-    """The variance-exploding SDE described by Song et al. (2020) in equation (9).
-
-    Here, the SDE is given by
-    dx = sqrt(d(sigma^2(t))/dt) dw
-
-    We use a geometric schedule: sigma(t) = sigma_min * (sigma_max / sigma_min)^t.
-    """
+    """The variance-exploding SDE described by Song et al. (2020) in equation (9)."""
 
     def __init__(
         self,
@@ -436,32 +476,25 @@ class VeSde(Sde):
         super().__init__(score_net)
 
     def drift(self, x, t):
-        """The drift coefficient f(x, t) of the forward SDE"""
         return torch.zeros_like(x)
 
     def diff(self, t):
-        """The diffusion coefficient g(t) of the forward SDE
-
-        Here, this is given by sqrt(d(sigma^2(t))/dt).
-        """
         sigma = self.sigma(t)
         diff = sigma * torch.sqrt(2 * (torch.log(self.sigma_max) - torch.log(self.sigma_min)))
         return diff
 
     def sigma(self, t_end, t_start=0.0):
-        """The standard deviation of x(t_end) | x(t_start)"""
-        if isinstance(t_start, numbers.Number) and t_start == 0:  # t_start equals the number 0
+        if isinstance(t_start, numbers.Number) and t_start == 0:
             return self.sigma_min * (self.sigma_max / self.sigma_min) ** t_end
         else:
             return torch.sqrt(self.sigma(t_end) ** 2 - self.sigma(t_start) ** 2)
 
     def _trace_of_drift_derivative(self, x: torch.Tensor, t: float):
-        """Override the trace of the drift derivative into an anlytical form which is fast to compute"""
         batch_size = x.shape[0]
         return torch.zeros(batch_size, device=x.device, dtype=x.dtype)
 
-    def solve_forward_sde(self, x_start, t_end=1.0, t_start=0.0, return_eps=False):
-        """Solve the SDE forward from time t_start to t_end"""
+    def solve_forward_sde__ORIGINAL(self, x_start, t_end=1.0, t_start=0.0, return_eps=False):
+        """Original version kept for reference."""
         t_start, t_end = self._match_timestep_shapes(t_start, t_end)
         t_start, t_end = t_start.to(x_start.device), t_end.to(x_start.device)
         assert torch.all(t_start <= t_end)
@@ -469,12 +502,31 @@ class VeSde(Sde):
         sigma_end = self.sigma(t_start=t_start, t_end=t_end)
         eps = torch.randn_like(x_start)
 
-        if sigma_end.ndim > 0:  # sigma is batched, so add a dim for broadcasting
+        if sigma_end.ndim > 0:
             sigma_end = sigma_end[..., None]
 
         x_end = sigma_end * torch.randn_like(x_start)
 
-        if return_eps:  # epsilon, the random noise value, may be needed for training
+        if return_eps:
+            return x_end, eps
+        else:
+            return x_end
+
+    def solve_forward_sde(self, x_start, t_end=1.0, t_start=0.0, return_eps=False):
+        """Solve the VE forward SDE analytically: x_end = x_start + sigma_inc * eps"""
+        t_start, t_end = self._match_timestep_shapes(t_start, t_end)
+        t_start, t_end = t_start.to(x_start.device), t_end.to(x_start.device)
+        assert torch.all(t_start <= t_end)
+
+        sigma_inc = self.sigma(t_start=t_start, t_end=t_end)
+        eps = torch.randn_like(x_start)
+
+        if sigma_inc.ndim > 0:
+            sigma_inc = sigma_inc.reshape(x_start.shape[:1] + (1,) * (x_start.ndim - 1))
+
+        x_end = x_start + sigma_inc * eps
+
+        if return_eps:
             return x_end, eps
         else:
             return x_end

@@ -5,5 +5,5 @@ in .pretty.py
 """
 
 from .images import image_grid
-from .scatterplots import visualize_estimates_heatmap, visualize_umap_clusters
+from .scatterplots import visualize_estimates_heatmap, visualize_umap_clusters, visualize_3d_clusters, visualize_pca_clusters
 from .trend import plot_trends
